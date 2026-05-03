@@ -21,7 +21,7 @@ class GPT2Layer(nn.Module):
     self.out_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
     self.out_dropout = nn.Dropout(config.hidden_dropout_prob)
 
-  def add(self, input_, output, dense_layer, dropout):
+  def add(self, input, output, dense_layer, dropout):
     """
     TODO: Implement this helper method for the forward function.
       - This function is applied after the multi-head attention layer as well as after the feed forward layer.
@@ -32,7 +32,7 @@ class GPT2Layer(nn.Module):
     ### YOUR CODE HERE
     dense_layer_out = dense_layer(output)
     dropout_out = dropout(dense_layer_out)
-    return input_ + dropout_out
+    return input + dropout_out
 
   def forward(self, hidden_states, attention_mask):
     """
