@@ -34,23 +34,22 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
     ### YOUR CODE HERE
     
-    # Recall that key, query and value have the following dimensions
-    # Batch size,  Number of heads, Sequence length, Attention head size/dimension
-    # Calculates the first scores: Q @ K.T
     scores = torch.matmul(query, key.transpose(-1, -2))
-    # Retrives the attention dimension from the query (same would have been for key or value)
-    attention_dim = query.shape[-1]
-    # Normalization by the attention dimension
-    scores = scores / (attention_dim ** 0.5)
-    # Application of the attention mask
-    scores = scores.masked_fill(attention_mask == 0, float("-inf"))
-    # Apply softmax
+    scores = scores / (query.shape[-1] ** 0.5)
+
+    seq_len = scores.size(-1)
+    causal_mask = torch.tril(
+        torch.ones(seq_len, seq_len, device=scores.device)
+    ).reshape(1, 1, seq_len, seq_len)
+
+    scores = scores.masked_fill(causal_mask == 0, float("-inf"))
+
+    scores = scores + attention_mask
+
     attn_probs = scores.softmax(dim=-1)
-    # Apply dropout - optional (as suggested in the __init__)
     attn_probs = self.dropout(attn_probs)
-    # Last multiplication
+
     values = torch.matmul(attn_probs, value)
-    # Concat
     attn_values = rearrange(values, "b h t d -> b t (h d)")
     return attn_values
 
