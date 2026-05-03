@@ -21,7 +21,7 @@ class GPT2Layer(nn.Module):
     self.out_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
     self.out_dropout = nn.Dropout(config.hidden_dropout_prob)
 
-  def add(self, input, output, dense_layer, dropout):
+  def add(self, input_, output, dense_layer, dropout):
     """
     TODO: Implement this helper method for the forward function.
       - This function is applied after the multi-head attention layer as well as after the feed forward layer.
@@ -30,8 +30,9 @@ class GPT2Layer(nn.Module):
         IN THIS FUNCTION.
     """
     ### YOUR CODE HERE
-    raise NotImplementedError
-
+    dense_layer_out = dense_layer(output)
+    dropout_out = dropout(dense_layer_out)
+    return input_ + dropout_out
 
   def forward(self, hidden_states, attention_mask):
     """
@@ -41,7 +42,30 @@ class GPT2Layer(nn.Module):
            - Apply dropout, residual connection, and layer normalization according to the plot in the assignment. (Use self.add)
            - A feed-forward layer that applies transformations to further refine the hidden states.
     """
+    attention_layer_norm_out = self.attention_layer_norm(hidden_states)
+    self_attention_out = self.self_attention(
+        attention_layer_norm_out,
+        attention_mask
+    )
 
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    out_first = self.add(
+        input=hidden_states,
+        output=self_attention_out,
+        dense_layer=self.attention_dense,
+        dropout=self.attention_dropout
+    )
+
+    out_layer_norm_out = self.out_layer_norm(out_first)
+
+    interm_dense_out = self.interm_dense(out_layer_norm_out)
+
+    interm_af_out = self.interm_af(interm_dense_out)
+
+    out_second = self.add(
+        input=out_first,
+        output=interm_af_out,
+        dense_layer=self.out_dense,
+        dropout=self.out_dropout
+    )
+    return out_second
 
