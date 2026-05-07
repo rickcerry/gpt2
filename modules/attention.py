@@ -34,7 +34,7 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
     ### YOUR CODE HERE
     
-    scores = torch.matmul(query, key.transpose(-1, -2))
+    scores = torch.matmul(query, key.transpose(-1, -2).contiguous())
     scores = scores / (query.shape[-1] ** 0.5)
 
     seq_len = scores.size(-1)
@@ -44,7 +44,8 @@ class CausalSelfAttention(nn.Module):
 
     scores = scores.masked_fill(causal_mask == 0, float("-inf"))
 
-    scores = scores + attention_mask
+    if attention_mask is not None:
+      scores = scores + attention_mask
 
     attn_probs = scores.softmax(dim=-1)
     attn_probs = self.dropout(attn_probs)

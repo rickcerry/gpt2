@@ -57,9 +57,7 @@ class GPT2Layer(nn.Module):
 
     out_layer_norm_out = self.out_layer_norm(out_first)
 
-    interm_dense_out = self.interm_dense(out_layer_norm_out)
-
-    interm_af_out = self.interm_af(interm_dense_out)
+    interm_af_out = self.interm_af(self.interm_dense(out_layer_norm_out))
 
     out_second = self.add(
         input=out_first,
