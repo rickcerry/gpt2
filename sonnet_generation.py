@@ -15,7 +15,7 @@ import numpy as np
 import torch.nn.functional as F
 
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 from transformers import GPT2Tokenizer
 from einops import rearrange
@@ -28,6 +28,9 @@ from models.gpt2 import GPT2Model
 from optimizer import AdamW
 
 TQDM_DISABLE = False
+
+# To be decided
+TRAINING_SET_SIZE = 0.9
 
 
 # Fix the random seed.
@@ -61,13 +64,18 @@ class SonnetGPT(nn.Module):
     not just the distribution over next tokens for the last token!
     """
     ### YOUR CODE HERE
-    raise NotImplementedError
+    #raise NotImplementedError
+    last_hidden_state = self.gpt(input_ids, attention_mask)['last_hidden_state']
+    logits = self.gpt.hidden_state_to_token(last_hidden_state)
+    return logits
 
 
   def get_device(self):
     for param in self.gpt.parameters():
       return param.device
-
+  
+  # Old generate function
+  '''
   @torch.no_grad()
   def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
     """
@@ -114,7 +122,89 @@ class SonnetGPT(nn.Module):
 
     generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
     return token_ids, generated_output
+  '''
+  
+  @torch.no_grad()
+  def generate(self, encoding, temperature=0.7, top_k=20, top_p=0.9, max_length=128):
+    """
+    Generates a sonnet using temperature scaling, top-k sampling,
+    and top-p nucleus sampling.
+    """
 
+    self.eval()
+
+    device = self.get_device()
+    token_ids = encoding.to(device)
+
+    attention_mask = torch.ones(
+        token_ids.shape,
+        dtype=torch.int64,
+        device=device
+    )
+
+    for _ in range(max_length):
+        logits_sequence = self.forward(token_ids, attention_mask)
+        next_token_logits = logits_sequence[:, -1, :] / temperature
+
+        # Top-k filtering
+        if top_k is not None and top_k > 0:
+            top_k = min(top_k, next_token_logits.size(-1))
+            threshold = torch.topk(next_token_logits, top_k, dim=-1)[0][..., -1, None]
+            indices_to_remove = next_token_logits < threshold
+            next_token_logits = next_token_logits.masked_fill(
+                indices_to_remove,
+                float("-inf")
+            )
+
+        # Top-p filtering
+        if top_p is not None and top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(
+                next_token_logits,
+                descending=True,
+                dim=-1
+            )
+
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+
+            sorted_indices_to_remove = cumulative_probs > top_p
+
+            # Keep the first token that exceeds top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+
+            indices_to_remove = sorted_indices_to_remove.scatter(
+                dim=1,
+                index=sorted_indices,
+                src=sorted_indices_to_remove
+            )
+
+            next_token_logits = next_token_logits.masked_fill(
+                indices_to_remove,
+                float("-inf")
+            )
+
+        probs = torch.softmax(next_token_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        if next_token.item() == self.tokenizer.eos_token_id:
+            break
+
+        token_ids = torch.cat([token_ids, next_token], dim=1)
+
+        new_attention = torch.ones(
+            (token_ids.shape[0], 1),
+            dtype=torch.int64,
+            device=device
+        )
+
+        attention_mask = torch.cat([attention_mask, new_attention], dim=1)
+
+    generated_output = self.tokenizer.decode(
+    token_ids[0].cpu().numpy().tolist()
+    )
+
+    return token_ids, generated_output
 
 def save_model(model, optimizer, args, filepath):
   save_info = {
@@ -129,60 +219,205 @@ def save_model(model, optimizer, args, filepath):
   torch.save(save_info, filepath)
   print(f"save the model to {filepath}")
 
+# Training function and helper functions
 
-def train(args):
-  """Train GPT-2 for paraphrase detection on the Quora dataset."""
-  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  # Create the data and its corresponding datasets and dataloader.
-  sonnet_dataset = SonnetsDataset(args.sonnet_path)
-  sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
-                                 collate_fn=sonnet_dataset.collate_fn)
+def create_train_val_dataloaders(dataset, batch_size, collate_fn, seed=42):
+    """
+    Split the sonnet dataset into train, validation, and test sets.
+    Split:
+    - 90% training
+    - 10% validation
+    """
 
-  # Create the held-out dataset: these only have the first 3 lines. Your job is to fill in the rest!
-  held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
+    n = len(dataset)
+    train_size = int(0.9 * n)
+    val_size = n - train_size
 
-  args = add_arguments(args)
-  model = SonnetGPT(args)
-  model = model.to(device)
+    train_dataset, val_dataset = random_split(
+        dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(seed)
+    )
 
-  lr = args.lr
-  optimizer = AdamW(model.parameters(), lr=lr)
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        batch_size=batch_size,
+        collate_fn=collate_fn
+    )
 
-  # Run for the specified number of epochs.
-  for epoch in range(args.epochs):
+    val_dataloader = DataLoader(
+        val_dataset,
+        shuffle=False,
+        batch_size=batch_size,
+        collate_fn=collate_fn
+    )
+
+    return train_dataloader, val_dataloader
+
+
+def compute_loss(model, batch, device):
+    """
+    Compute next-token prediction loss for one batch.
+    """
+
+    b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+
+    b_ids = b_ids.to(device)
+    b_mask = b_mask.to(device)
+
+    logits = model(b_ids, b_mask)
+
+    # Ignore the last prediction
+    logits = rearrange(
+        logits[:, :-1].contiguous(),
+        'b t d -> (b t) d'
+    )
+
+    # Ignore the first token in the labels
+    labels = b_ids[:, 1:].contiguous().flatten()
+
+    loss = F.cross_entropy(logits, labels, reduction='mean')
+
+    return loss
+  
+
+def train_one_epoch(model, train_dataloader, optimizer, device, epoch):
+    """
+    Train the model for one epoch.
+    """
+
     model.train()
-    train_loss = 0
+
+    train_loss = 0.0
     num_batches = 0
 
-    for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-      # Get the input and move it to the gpu (I do not recommend training this model on CPU).
-      b_ids, b_mask = batch['token_ids'], batch['attention_mask']
-      b_ids = b_ids.to(device)
-      b_mask = b_mask.to(device)
+    for batch in tqdm(train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+        optimizer.zero_grad()
 
-      # Compute the loss, gradients, and update the model's parameters.
-      optimizer.zero_grad()
-      logits = model(b_ids, b_mask)
-      logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
-      labels = b_ids[:, 1:].contiguous().flatten()  # Ignore the first token to compose the labels.
-      loss = F.cross_entropy(logits, labels, reduction='mean')
-      loss.backward()
-      optimizer.step()
+        loss = compute_loss(model, batch, device)
 
-      train_loss += loss.item()
-      num_batches += 1
+        loss.backward()
+        optimizer.step()
 
-    train_loss = train_loss / num_batches
-    print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
-    print('Generating several output sonnets...')
+        train_loss += loss.item()
+        num_batches += 1
+
+    return train_loss / num_batches
+  
+ 
+def evaluate_loss(model, dataloader, device):
+    """
+    Compute average loss without updating the model.
+    Used for validation and test.
+    """
+
     model.eval()
-    for batch in held_out_sonnet_dataset:
-      encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
-      print(f'{batch[1]}{output[1]}\n\n')
 
-    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            loss = compute_loss(model, batch, device)
+
+            total_loss += loss.item()
+            num_batches += 1
+
+    return total_loss / num_batches 
+  
+
+def train(args):
+    """Train GPT-2 for sonnet generation with train/validation split."""
+
+    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+
+    args = add_arguments(args)
+
+    # Full dataset of complete sonnets
+    sonnet_dataset = SonnetsDataset(args.sonnet_path)
+
+    # Split complete sonnets into train / validation / test
+    train_dataloader, val_dataloader = create_train_val_dataloaders(
+        sonnet_dataset,
+        args.batch_size,
+        sonnet_dataset.collate_fn
+    )
+
+    # Held-out dataset: only first 3 lines, used only for qualitative generation
+    held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
+
+    model = SonnetGPT(args)
+    model = model.to(device)
+
+    optimizer = AdamW(model.parameters(), lr=args.lr)
+
+    best_val_loss = float("inf")
+    patience = 3
+    patience_counter = 0
+    min_delta = 1e-3
+
+    for epoch in range(args.epochs):
+
+        train_loss = train_one_epoch(
+            model,
+            train_dataloader,
+            optimizer,
+            device,
+            epoch
+        )
+
+        val_loss = evaluate_loss(
+            model,
+            val_dataloader,
+            device
+        )
+
+        print(
+            f"Epoch {epoch}: "
+            f"train loss :: {train_loss:.3f}, "
+            f"val loss :: {val_loss:.3f}"
+        )
+
+        if val_loss < best_val_loss - min_delta:
+            best_val_loss = val_loss
+            patience_counter = 0
+
+            save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+
+        else:
+            patience_counter += 1
+
+            print(f"No improvement. Patience: {patience_counter}/{patience}")
+
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
+
+        print('Generating several output sonnets...')
+
+        model.eval()
+
+        for i, batch in enumerate(held_out_sonnet_dataset):
+            print(f"Batch {i}")
+            print()
+            encoding = model.tokenizer(
+                batch[1],
+                return_tensors='pt',
+                padding=True,
+                truncation=True
+            ).to(device)
+
+            output = model.generate(
+            encoding['input_ids'],
+            temperature=args.temperature,
+            top_p=args.top_p
+            )
+
+            print(f'{output[1]}\n\n')
+
+
+    #save_model(model, optimizer, args, f'final_{args.filepath}')
 
 
 @torch.no_grad()
