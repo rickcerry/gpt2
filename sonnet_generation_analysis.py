@@ -25,13 +25,88 @@ from datasets import (
 )
 from models.gpt2 import GPT2Model
 
-from optimizer_sonnet_generation import AdamW
+from optimizer_sonnet_generation import AdamW, NorMuon, HTMuon, MuonWrapper
+
+from pathlib import Path
+import pandas as pd
+import matplotlib.pyplot as plt
+import json
+import time
+
+TRAIN_SIZE = 0.8
+
+RUN_DIR = Path("runs/sonnet_generator")
+RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+epoch_logs = []
+generation_logs = []
+
+training_start_time = time.perf_counter()
+best_val_loss = float("inf")
 
 TQDM_DISABLE = False
 
-# To be decided
-TRAINING_SET_SIZE = 0.9
 
+def log_epoch_metrics(epoch, train_loss, val_loss):
+    epoch_logs.append({
+        "epoch": epoch,
+        "train/loss": train_loss,
+        "val/loss": val_loss,
+        "train/perplexity": np.exp(train_loss),
+        "val/perplexity": np.exp(val_loss),
+        "time_sec": time.perf_counter() - training_start_time,
+    })
+
+
+def log_generation(epoch, batch_idx, prompt, generated_text):
+    generation_logs.append({
+        "epoch": epoch,
+        "batch_idx": batch_idx,
+        "prompt": prompt,
+        "generated_text": generated_text,
+    })
+
+
+def save_checkpoint(model, optimizer, args, path, epoch, val_loss):
+    checkpoint = {
+        "model": model.state_dict(),
+        "optim": optimizer.state_dict(),
+        "args": args,
+        "epoch": epoch,
+        "val_loss": val_loss,
+        "system_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+        "torch_rng": torch.random.get_rng_state(),
+    }
+    torch.save(checkpoint, path)
+
+
+def save_logs_and_plots(args):
+    epoch_df = pd.DataFrame(epoch_logs)
+    generation_df = pd.DataFrame(generation_logs)
+
+    epoch_df.to_csv(RUN_DIR / "epoch_metrics.csv", index=False)
+    generation_df.to_csv(RUN_DIR / "generated_samples.csv", index=False)
+
+    with open(RUN_DIR / "args.json", "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    if len(epoch_df) > 0:
+        epoch_df.plot(x="epoch", y=["train/loss", "val/loss"])
+        plt.title("Training and validation loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.savefig(RUN_DIR / "loss_curve.png", dpi=300, bbox_inches="tight")
+        plt.show()
+        
+        epoch_df.plot(x="epoch", y=["train/perplexity", "val/perplexity"])
+        plt.title("Training and validation perplexity")
+        plt.xlabel("Epoch")
+        plt.ylabel("Perplexity")
+        plt.savefig(RUN_DIR / "perplexity_curve.png", dpi=300, bbox_inches="tight")
+        plt.show()
+
+    print(f"Saved everything in: {RUN_DIR}")
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -225,12 +300,12 @@ def create_train_val_dataloaders(dataset, batch_size, collate_fn, seed=42):
     """
     Split the sonnet dataset into train, validation, and test sets.
     Split:
-    - 90% training
-    - 10% validation
+    - 70% training
+    - 30% validation
     """
 
     n = len(dataset)
-    train_size = int(0.9 * n)
+    train_size = int(TRAIN_SIZE * n)
     val_size = n - train_size
 
     train_dataset, val_dataset = random_split(
@@ -326,13 +401,29 @@ def evaluate_loss(model, dataloader, device):
 
     return total_loss / num_batches 
   
-
 def train(args):
     """Train GPT-2 for sonnet generation with train/validation split."""
 
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
     args = add_arguments(args)
+
+    global RUN_DIR, epoch_logs, generation_logs, training_start_time
+
+    RUN_DIR = Path(
+    f"runs/sonnet_generator/"
+    f"optimizer_{args.optimizer}_lr_{args.lr}_wd_{args.weight_decay}_seed_{args.seed}"
+    )
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    
+    print(args.epochs)
+
+    epoch_logs = []
+    generation_logs = []
+    training_start_time = time.perf_counter()
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     # Full dataset of complete sonnets
     sonnet_dataset = SonnetsDataset(args.sonnet_path)
@@ -349,13 +440,56 @@ def train(args):
 
     model = SonnetGPT(args)
     model = model.to(device)
+    
+    num_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr)
+    print(f"Total parameters: {num_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+
+    with open(RUN_DIR / "model_stats.json", "w") as f:
+        json.dump({
+            "total_parameters": num_params,
+            "trainable_parameters": trainable_params,
+        }, f, indent=2)
+
+    if args.optimizer == "adamw":
+        optimizer = AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2)
+        )
+
+    elif args.optimizer == "normuon":
+        optimizer = NorMuon(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2)
+        )
+
+    elif args.optimizer == "htmuon":
+        optimizer = HTMuon(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(args.beta1, args.beta2)
+        )
+    elif args.optimizer == "muon":
+        optimizer = MuonWrapper(
+            model, args
+        )
+
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
 
     best_val_loss = float("inf")
     patience = args.patience
     patience_counter = 0
     min_delta = args.min_delta
+    
+    best_epoch = None
 
     for epoch in range(args.epochs):
 
@@ -378,13 +512,21 @@ def train(args):
             f"train loss :: {train_loss:.3f}, "
             f"val loss :: {val_loss:.3f}"
         )
+        
+        log_epoch_metrics(epoch, train_loss, val_loss)
 
         if val_loss < best_val_loss - min_delta:
             best_val_loss = val_loss
             patience_counter = 0
-
-            save_model(model, optimizer, args, f'best_{args.filepath}')
-
+            best_epoch = epoch
+            save_checkpoint(
+                            model=model,
+                            optimizer=optimizer,
+                            args=args,
+                            path=RUN_DIR / "best_sonnet_gpt.pt",
+                            epoch=epoch,
+                            val_loss=val_loss
+                        )
         else:
             patience_counter += 1
 
@@ -394,6 +536,8 @@ def train(args):
                 print("Early stopping triggered.")
                 break
 
+        # For training
+        '''
         print('Generating several output sonnets...')
 
         model.eval()
@@ -409,21 +553,58 @@ def train(args):
             ).to(device)
 
             output = model.generate(
-            encoding['input_ids'],
-            temperature=args.temperature,
-            top_p=args.top_p
-            )
+                      encoding['input_ids'],
+                      temperature=args.temperature,
+                      top_k=args.top_k,
+                      top_p=args.top_p
+                  )
 
             print(f'{output[1]}\n\n')
+            log_generation(
+              epoch=epoch,
+              batch_idx=i,
+              prompt=batch[1],
+              generated_text=output[1]
+          )
+        '''
 
+    total_training_time = time.perf_counter() - training_start_time
 
-    #save_model(model, optimizer, args, f'final_{args.filepath}')
+    if device.type == "cuda":
+        peak_memory_mb = torch.cuda.max_memory_allocated() / 1024**2
+    else:
+        peak_memory_mb = None
+
+    summary = {
+        "optimizer": args.optimizer,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs_completed": epoch + 1,
+        "best_epoch": best_epoch,
+        "best_val_loss": best_val_loss,
+        "best_val_perplexity": float(np.exp(best_val_loss)),
+        "total_training_time_sec": total_training_time,
+        "peak_gpu_memory_mb": peak_memory_mb,
+    }
+
+    with open(RUN_DIR / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    
+    save_logs_and_plots(args)
+    save_model(model, optimizer, args, f'final_{args.filepath}')
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'best_{args.filepath}', weights_only=False)
+
+  global RUN_DIR
+  RUN_DIR = Path(
+      f"runs/sonnet_generator/optimizer_adamw_lr_3e-05_wd_0.01_seed_11711"
+  )
+
+  saved = torch.load(RUN_DIR / "best_sonnet_gpt.pt", weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -437,13 +618,13 @@ def generate_submission_sonnets(args):
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
+    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)[0][0]
     decoded_output = model.tokenizer.decode(output)
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
 
     print(f'{decoded_output}\n\n')
-
+  Path(args.sonnet_out).parent.mkdir(parents=True, exist_ok=True)
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
     for sonnet in generated_sonnets:
@@ -470,13 +651,22 @@ def get_args():
                     help="Number of most likely tokens kept for top-k sampling.") # Added
   parser.add_argument("--patience", type=int, default=5,
                     help="Number of epochs to wait before early stopping.") # Added
-  parser.add_argument("--min_delta", type=float, default=0.005,
+  parser.add_argument("--min_delta", type=float, default=0.001,
                     help="Minimum validation loss improvement required.") # Added
 
   parser.add_argument("--batch_size", help='The training batch size.', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
+  
+  parser.add_argument("--optimizer", type=str, default="adamw",
+                    choices=["adamw", "normuon", "htmuon", "muon"],
+                    help="Optimizer to use.") # Added
+  
+  parser.add_argument("--weight_decay", type=float, default=0.01)
+  parser.add_argument("--beta1", type=float, default=0.9)
+  parser.add_argument("--beta2", type=float, default=0.999)
+  parser.add_argument("--eps", type=float, default=1e-6) # Added
 
   args = parser.parse_args()
   return args
